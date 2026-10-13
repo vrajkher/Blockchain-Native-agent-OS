@@ -21,6 +21,7 @@ class SwarmTestCase:
 
     def make_swarm(self, **overrides):
         self._tmp = tempfile.TemporaryDirectory()
+        overrides.setdefault("inference", {"backend": "mock"})
         cfg = load_config(home=self._tmp.name, **overrides)
         gov = ResourceGovernor(cfg.governor, meminfo=fake_meminfo(), app_rss=lambda: 200 * MiB)
         swarm = Swarm(cfg, backend=MockBackend(delay=0.02), governor=gov)

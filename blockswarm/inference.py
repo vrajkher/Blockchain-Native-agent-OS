@@ -1,10 +1,10 @@
-"""Shared inference service: one resident model behind an authenticated gate.
+"""Shared inference service: one model API behind an authenticated gate.
 
-* exactly one backend/model instance per process
+* exactly one backend (one model) shared by every agent
 * capability-authenticated (scope ``inference``) per request
 * per-agent context, output and rolling token-budget limits
-* bounded concurrency (default 1 simultaneous CPU inference)
-* stateless requests: no conversation/KV state is shared between agents
+* bounded concurrency (default 1 request in flight)
+* stateless requests: no conversation state is shared between agents
 """
 
 from __future__ import annotations
@@ -12,15 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import re
-import threading
 import time
-import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
 from .capabilities import Capability, CapabilityAuthority
 from .config import InferenceConfig
@@ -34,6 +30,10 @@ class InferenceError(Exception):
 
 class QuotaError(InferenceError, PermissionError):
     pass
+
+
+class ServiceUnavailable(InferenceError):
+    """The model service failed (auth, network, rate limit, 5xx): not the agent's fault."""
 
 
 @dataclass
@@ -58,6 +58,9 @@ class Backend:
     def count_tokens(self, text: str) -> int:
         # Conservative estimate for backends without a tokenizer (~3 bytes/token).
         return math.ceil(len(text.encode("utf-8")) / 3)
+
+    def preflight(self) -> None:
+        """Fail fast at startup if the backend cannot serve requests."""
 
     def close(self) -> None:
         pass
@@ -86,108 +89,114 @@ class MockBackend(Backend):
         return text, self.count_tokens(system + user), self.count_tokens(text)
 
 
-class LlamaCppBackend(Backend):
-    """In-process llama.cpp via llama-cpp-python. Model is mmapped once."""
+class AnthropicBackend(Backend):
+    """Claude via the official Anthropic SDK. The single shared model for all agents.
 
-    name = "llama-cpp"
-
-    def __init__(self, cfg: InferenceConfig):
-        try:
-            from llama_cpp import Llama
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise InferenceError("pip install llama-cpp-python to use backend 'llama-cpp'") from exc
-        if not cfg.model_path or not os.path.exists(cfg.model_path):
-            raise InferenceError(f"GGUF model not found: {cfg.model_path!r}")
-        self._lock = threading.Lock()  # llama.cpp contexts are not thread-safe
-        self.llm = Llama(
-            model_path=cfg.model_path, n_ctx=cfg.n_ctx, n_threads=cfg.n_threads or None,
-            n_batch=256, n_gpu_layers=0, use_mmap=True, use_mlock=False, verbose=False,
-        )
-
-    def count_tokens(self, text: str) -> int:
-        with self._lock:
-            return len(self.llm.tokenize(text.encode("utf-8"), add_bos=False, special=True))
-
-    def complete(self, messages, max_tokens, temperature, json_schema):
-        with self._lock:
-            self.llm.reset()  # never reuse another agent's KV cache
-            kwargs: dict[str, Any] = {"messages": messages, "max_tokens": max_tokens,
-                                      "temperature": temperature}
-            if json_schema is not None:
-                # Grammar-constrained decoding: output is forced into the schema's shape.
-                kwargs["response_format"] = {"type": "json_object",
-                                             "schema": grammar_schema(json_schema)}
-            out = self.llm.create_chat_completion(**kwargs)
-            self.llm.reset()
-        usage = out.get("usage", {})
-        return (out["choices"][0]["message"]["content"] or "",
-                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-    def close(self) -> None:
-        if hasattr(self.llm, "close"):
-            self.llm.close()
-
-
-class HttpBackend(Backend):
-    """OpenAI-compatible HTTP: a local ``llama-server`` or an optional remote model."""
-
-    name = "http"
-
-    def __init__(self, cfg: InferenceConfig):
-        self.cfg = cfg
-        self.api_key = os.environ.get(cfg.http_api_key_env, "")
-        host = urlparse(cfg.http_url).hostname or ""
-        self.local = host in ("127.0.0.1", "localhost", "::1")
-        if not self.local and urlparse(cfg.http_url).scheme != "https":
-            raise InferenceError("remote model adapters must use https")
-
-    def complete(self, messages, max_tokens, temperature, json_schema):
-        body: dict[str, Any] = {"model": self.cfg.http_model, "messages": messages,
-                                "max_tokens": max_tokens, "temperature": temperature}
-        if json_schema is not None:
-            body["response_format"] = {"type": "json_schema",
-                                       "json_schema": {"name": "output",
-                                                       "schema": grammar_schema(json_schema)}}
-        if self.local:
-            body["cache_prompt"] = False  # llama-server: no cross-request KV reuse
-        req = urllib.request.Request(self.cfg.http_url, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
-        if self.api_key:
-            req.add_header("Authorization", f"Bearer {self.api_key}")
-        with urllib.request.urlopen(req, timeout=self.cfg.request_timeout_seconds) as resp:
-            out = json.loads(resp.read(4 * 1024 * 1024))
-        usage = out.get("usage", {})
-        return (out["choices"][0]["message"]["content"] or "",
-                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-
-_GRAMMAR_DROP = ("maxLength", "minimum", "maximum")
-
-
-def grammar_schema(schema: dict) -> dict:
-    """Schema copy for constrained decoding.
-
-    Length/range bounds are dropped because GBNF expands them into huge rule
-    sets; they are still enforced after decoding by normalization and the
-    deterministic verifier.
+    * structured outputs (``output_config.format``) constrain replies to the task schema
+    * server-side refusal fallbacks are opted into by default
+    * credentials come from the SDK's normal resolution (``ANTHROPIC_API_KEY``,
+      ``ANTHROPIC_AUTH_TOKEN`` or an ``ant auth login`` profile); never from config
+    * every request is stateless: it carries only the calling agent's messages
     """
-    out = {k: v for k, v in schema.items() if k not in _GRAMMAR_DROP}
-    if out.get("minLength", 0) > 8:
-        out.pop("minLength")
+
+    name = "anthropic"
+    FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+    def __init__(self, cfg: InferenceConfig, client: Any = None):
+        self.cfg = cfg
+        if client is None:
+            try:
+                import anthropic
+            except ImportError as exc:  # pragma: no cover - dependency is declared
+                raise InferenceError("pip install anthropic") from exc
+            client = anthropic.Anthropic(timeout=cfg.request_timeout_seconds,
+                                         max_retries=cfg.max_retries)
+        self.client = client
+
+    def preflight(self) -> None:
+        """Check credentials and the model ID without generating tokens."""
+        import anthropic
+        try:
+            self.client.models.retrieve(self.cfg.model)
+        except anthropic.NotFoundError as exc:
+            raise InferenceError(f"unknown model {self.cfg.model!r}") from exc
+        except Exception as exc:
+            raise self._service_error(exc) from exc
+
+    @staticmethod
+    def _service_error(exc: Exception) -> Exception:
+        import anthropic
+        if isinstance(exc, (anthropic.AuthenticationError, TypeError)):
+            # TypeError: the SDK found no credentials at all.
+            return ServiceUnavailable("Anthropic API credentials missing or invalid: set "
+                                      "ANTHROPIC_API_KEY or run `ant auth login`")
+        if isinstance(exc, anthropic.PermissionDeniedError):
+            return ServiceUnavailable("Anthropic API key lacks permission for this model")
+        if isinstance(exc, anthropic.RateLimitError):
+            return ServiceUnavailable("Anthropic API rate limit (retries exhausted)")
+        if isinstance(exc, anthropic.APIStatusError):
+            return ServiceUnavailable(f"Anthropic API error {exc.status_code}")
+        if isinstance(exc, anthropic.APIConnectionError):
+            return ServiceUnavailable("cannot reach the Anthropic API")
+        return exc
+
+    def complete(self, messages, max_tokens, temperature, json_schema):
+        import anthropic
+
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        convo = [{"role": m["role"], "content": m["content"]}
+                 for m in messages if m["role"] != "system"]
+        output_config: dict[str, Any] = {"effort": self.cfg.effort}
+        if json_schema is not None:
+            output_config["format"] = {"type": "json_schema",
+                                       "schema": decoding_schema(json_schema)}
+        kwargs: dict[str, Any] = {"model": self.cfg.model, "max_tokens": max_tokens,
+                                  "messages": convo, "output_config": output_config}
+        if system:
+            kwargs["system"] = system
+        try:
+            if self.cfg.refusal_fallbacks:
+                resp = self.client.beta.messages.create(
+                    betas=[self.FALLBACK_BETA], fallbacks="default", **kwargs)
+            else:
+                resp = self.client.messages.create(**kwargs)
+        except anthropic.BadRequestError as exc:
+            raise InferenceError(f"Anthropic API rejected the request: {exc.message}") from exc
+        except (anthropic.APIError, TypeError) as exc:
+            raise self._service_error(exc) from exc
+        if resp.stop_reason == "refusal":
+            category = getattr(resp.stop_details, "category", None) if resp.stop_details else None
+            raise InferenceError(f"model declined the request (category: {category})")
+        if resp.stop_reason == "max_tokens":
+            raise InferenceError("model output hit max_tokens")
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        usage = resp.usage
+        return text, usage.input_tokens, usage.output_tokens
+
+
+_DECODING_DROP = ("minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems")
+
+
+def decoding_schema(schema: dict) -> dict:
+    """Schema copy sent to the API for constrained decoding.
+
+    Length/range/count bounds are dropped so the request only uses the core
+    structured-output keywords; the bounds are still enforced after decoding by
+    normalization and the deterministic verifier.
+    """
+    out = {k: v for k, v in schema.items() if k not in _DECODING_DROP}
     if "properties" in out:
-        out["properties"] = {k: grammar_schema(v) for k, v in out["properties"].items()}
+        out["properties"] = {k: decoding_schema(v) for k, v in out["properties"].items()}
     if isinstance(out.get("items"), dict):
-        out["items"] = grammar_schema(out["items"])
+        out["items"] = decoding_schema(out["items"])
     return out
 
 
 def make_backend(cfg: InferenceConfig) -> Backend:
     if cfg.backend == "mock":
         return MockBackend()
-    if cfg.backend == "llama-cpp":
-        return LlamaCppBackend(cfg)
-    if cfg.backend == "http":
-        return HttpBackend(cfg)
+    if cfg.backend == "anthropic":
+        return AnthropicBackend(cfg)
     raise InferenceError(f"unknown backend {cfg.backend}")
 
 
@@ -224,8 +233,6 @@ class InferenceService:
         if prompt_tokens > self.cfg.max_context_tokens_per_agent:
             raise QuotaError(f"prompt of {prompt_tokens} tokens exceeds per-agent context limit "
                              f"{self.cfg.max_context_tokens_per_agent}")
-        if prompt_tokens + max_out > self.cfg.n_ctx:
-            raise QuotaError("request exceeds model context window")
         if self.usage(agent_id) + prompt_tokens + max_out > self.cfg.token_budget_per_agent_window:
             raise QuotaError("per-agent token budget exhausted")
 

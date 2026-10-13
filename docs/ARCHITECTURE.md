@@ -2,10 +2,11 @@
 
 ## Principles
 
-* **One resident model, many identities.** Agents are cheap logical
+* **One shared model, many identities.** Agents are cheap logical
   identities (a key pair, a registry row, a checkpoint, private memory).
   Only the *active* agents consume execution resources. Inference is
-  centralized behind one authenticated service.
+  centralized behind one authenticated service that calls Claude through
+  the Anthropic API; no model weights run on the host.
 * **The host holds authority.** Keys, policy, capability issuance,
   verification and ledger writes live on the host. Agents receive signed
   artifacts and bound clients, never keys or database handles.
@@ -29,7 +30,7 @@
 │   ├─ envelope: sign task, consume nonce (replay gate)  ───────────┼──►│  │                        │
 │   │                                                               │   │  │  infer(msgs) ──────────┼──┐
 │   │  InferenceService ◄── capability check, per-agent limits ◄────┼───┼──┼────────────────────────┘  │
-│   │   └─ one Backend: llama.cpp GGUF | HTTP (llama-server/remote) │   │  │  call_tool(name,args) ─┼──┐
+│   │   └─ one Backend: Anthropic API (official SDK) | MOCK         │   │  │  call_tool(name,args) ─┼──┐
 │   │  ToolGateway ◄── capability check, rate limit, audit ◄────────┼───┼──┼────────────────────────┘  │
 │   │                                                               │   │  └───────────────────────┘
 │   ├─ sign result record AS the agent (key never leaves host)      │   │   Phase 1: in-process task
@@ -58,8 +59,10 @@ are already the ones that will be used then.
    the nonce.
 4. Irreversible tasks insert an idempotency key first. If it already exists,
    the task goes to `needs_review` and is never executed twice automatically.
-5. Harness runs in the sandbox with a timeout. LLM kinds use
-   grammar-constrained JSON decoding and one repair round.
+5. Harness runs in the sandbox with a timeout. LLM kinds call Claude with
+   structured outputs (`output_config.format` = the task's JSON schema) and
+   one repair round. Model-service failures (credentials, network, rate
+   limits, 5xx) are retried without being counted against the agent.
 6. Host builds the result record (`H(envelope)`, `H(output)`,
    `H(tool_calls)`), signs it with the agent's key, and verifies everything
    deterministically.
@@ -96,8 +99,25 @@ distinguishes `local-anvil` from confirmed public-chain consensus.
 * `allowed = 3` only if three guests *plus one guest of slack* fit both the
   application budget and the host headroom. Otherwise 2, else fewer, down to
   0 (dispatch paused, tasks stay queued).
-* Inference concurrency is a separate semaphore (default 1), independent of
-  how many agents are active.
+* Inference concurrency is a separate semaphore (default 1 API request in
+  flight), independent of how many agents are active. With a remote model it
+  bounds API rate and cost, not host CPU, so it can be raised safely.
+
+## Inference service
+
+* One `AnthropicBackend` (official `anthropic` SDK) serves every agent.
+  Default model `claude-opus-5-5`, `effort: low` for these short structured
+  tasks.
+* Each request is stateless and carries only the calling agent's system
+  prompt and input. Agents never share a conversation.
+* Replies are constrained by structured outputs. Length and range bounds are
+  stripped from the schema sent to the API and enforced afterwards by
+  normalization and the deterministic verifier.
+* Server-side refusal fallbacks (`fallbacks: "default"`) are on by default.
+  A final `refusal` or `max_tokens` stop is treated as a failed attempt.
+* Credentials never enter config files or agents. `demo` and `serve` run a
+  token-free preflight (`models.retrieve`) and refuse to start without valid
+  credentials.
 
 ## Result consensus vs. blockchain consensus
 

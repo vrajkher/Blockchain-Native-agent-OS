@@ -4,7 +4,7 @@
 Each configuration runs in a fresh subprocess so peak RSS (VmHWM) is per run.
 
     python scripts/bench.py --backend mock --agents 2 3 10 100
-    python scripts/bench.py --backend llama-cpp --model models/x.gguf --agents 2 3 10 100 --tasks 6
+    python scripts/bench.py --backend anthropic --agents 2 3 10 100 --tasks 6   # real API calls, costs money
 """
 
 from __future__ import annotations
@@ -36,10 +36,9 @@ def run_one(args) -> dict:
     mem0 = read_meminfo()
     rss0 = rss_bytes()
     with tempfile.TemporaryDirectory() as home:
-        inf = {"backend": args.backend, "model_path": args.model or "",
-               "max_output_tokens_per_request": args.max_tokens}
-        if args.threads:
-            inf["n_threads"] = args.threads
+        inf = {"backend": args.backend, "max_output_tokens_per_request": args.max_tokens}
+        if args.model:
+            inf["model"] = args.model
         cfg = load_config(home=home, inference=inf,
                           governor={"maximum_active_agents": args.max_active,
                                     "default_active_agents": min(2, args.max_active)})
@@ -82,7 +81,7 @@ def run_one(args) -> dict:
             "max_concurrent_inference": status["inference"]["max_concurrent"],
             "inference_requests": status["inference"]["requests"],
             "model_load_s": round(load_s, 2), "run_s": round(elapsed, 2),
-            "rss_mib": {"baseline": round(rss0 / 2**20, 1), "after_model": round(rss_model / 2**20, 1),
+            "rss_mib": {"baseline": round(rss0 / 2**20, 1), "after_init": round(rss_model / 2**20, 1),
                         "after_agents": round(rss_agents / 2**20, 1),
                         "max_during_run": round(samples["rss_max"] / 2**20, 1),
                         "peak_hwm": round(peak_rss_bytes() / 2**20, 1)},
@@ -104,8 +103,7 @@ def main() -> None:
     ap.add_argument("--agents", type=int, nargs="+", default=[2, 3, 10, 100])
     ap.add_argument("--tasks", type=int, default=12)
     ap.add_argument("--max-active", type=int, default=3)
-    ap.add_argument("--max-tokens", type=int, default=64)
-    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--child", action="store_true")
     args = ap.parse_args()
@@ -117,7 +115,7 @@ def main() -> None:
     for n in args.agents:
         cmd = [sys.executable, os.path.abspath(__file__), "--child", "--backend", args.backend,
                "--agents", str(n), "--tasks", str(args.tasks), "--max-active", str(args.max_active),
-               "--max-tokens", str(args.max_tokens), "--threads", str(args.threads),
+               "--max-tokens", str(args.max_tokens),
                "--timeout", str(args.timeout)]
         if args.model:
             cmd += ["--model", args.model]

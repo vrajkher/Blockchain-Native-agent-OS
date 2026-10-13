@@ -5,7 +5,7 @@ import unittest
 from blockswarm.capabilities import CapabilityAuthority, CapabilityError
 from blockswarm.config import InferenceConfig, load_config
 from blockswarm.db import Database
-from blockswarm.inference import InferenceService, MockBackend, QuotaError, grammar_schema
+from blockswarm.inference import InferenceService, MockBackend, QuotaError, decoding_schema
 from blockswarm.memory import AgentMemoryView, MemoryLimitError, MemoryStore
 from blockswarm.signing import SigningService
 from blockswarm.tasks import KINDS
@@ -25,7 +25,8 @@ class InferenceTests(unittest.TestCase):
         self.b, _ = signer.create_agent_key()
         self.auth = CapabilityAuthority(signer, host, lambda _a: False, 60)
         self.backend = MockBackend(delay=0.05)
-        self.cfg = InferenceConfig(max_context_tokens_per_agent=200, token_budget_per_agent_window=400)
+        self.cfg = InferenceConfig(backend="mock", max_context_tokens_per_agent=200, max_output_tokens_per_request=64,
+                                   token_budget_per_agent_window=400)
         self.svc = InferenceService(self.backend, self.auth, self.cfg, concurrency=1)
         self.cap_a = self.auth.issue(self.a, ["worker"], {"inference"})
         self.cap_b = self.auth.issue(self.b, ["worker"], {"inference"})
@@ -67,11 +68,13 @@ class InferenceTests(unittest.TestCase):
             with self.assertRaises(InferenceError):
                 asyncio.run(self.svc.infer(self.cap_a, self.a, bad))
 
-    def test_grammar_schema_drops_bounds_only(self):
-        g = grammar_schema(KINDS["summarize"].output_schema)
+    def test_decoding_schema_drops_bounds_only(self):
+        g = decoding_schema(KINDS["summarize"].output_schema)
         self.assertNotIn("maxLength", g["properties"]["summary"])
+        self.assertNotIn("maxItems", g["properties"]["key_points"])
         self.assertEqual(g["required"], ["summary", "key_points"])
-        self.assertEqual(g["properties"]["key_points"]["maxItems"], 5)
+        self.assertIs(g["additionalProperties"], False)
+        self.assertEqual(g["properties"]["key_points"]["items"], {"type": "string"})
 
 
 class MemoryTests(unittest.TestCase):

@@ -15,7 +15,7 @@ from .db import Database
 from .envelope import RESULT_DOMAIN, accept_task_envelope, make_task_envelope, result_record
 from .governor import ResourceGovernor
 from .harness import AgentContext, AgentHarness
-from .inference import Backend, InferenceService, make_backend
+from .inference import Backend, InferenceService, ServiceUnavailable, make_backend
 from .ledger import BlockchainRuntime, SimulatedLedger
 from .memory import MemoryStore
 from .nonces import NonceStore
@@ -292,6 +292,12 @@ class Swarm:
             self.queue.fail(task.task_id, aid, "agent terminated", retryable=True)
             self.db.audit("task_cancelled", aid, task.task_id)
             raise
+        except ServiceUnavailable as exc:
+            # The shared model service failed; the agent did nothing wrong.
+            status = self.queue.fail(task.task_id, aid, f"ServiceUnavailable: {exc}",
+                                     blame_agent=False)
+            self.db.audit("task_failed_service", aid, task.task_id, error=str(exc)[:300],
+                          new_status=status)
         except Exception as exc:
             status = self.queue.fail(task.task_id, aid, f"{type(exc).__name__}: {exc}")
             quarantined = self.registry.record_failure(aid, self.cfg.security.max_agent_failures)

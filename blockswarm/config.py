@@ -19,7 +19,7 @@ class GovernorConfig:
     default_active_agents: int = 2
     maximum_active_agents: int = 3
     preferred_guest_ram_mib: int = 256
-    model_instances: int = 1
+    model_instances: int = 1  # one shared model endpoint for all agents
     inference_concurrency: int = 1
     idle_agent_policy: str = "suspend_or_terminate"
     ram_pressure_policy: str = "reduce_concurrency"
@@ -29,19 +29,18 @@ class GovernorConfig:
 
 @dataclass
 class InferenceConfig:
-    # mock | llama-cpp | http
-    backend: str = "mock"
-    model_path: str = ""
-    http_url: str = "http://127.0.0.1:8080/v1/chat/completions"
-    http_api_key_env: str = "BLOCKSWARM_REMOTE_API_KEY"
-    http_model: str = "local"
-    n_ctx: int = 2048
-    n_threads: int = 0  # 0 = let llama.cpp decide
-    max_context_tokens_per_agent: int = 1536
-    max_output_tokens_per_request: int = 256
-    token_budget_per_agent_window: int = 20000
+    # anthropic: Claude via the Anthropic API (default) | mock: deterministic test double
+    backend: str = "anthropic"
+    model: str = "claude-opus-5-5"
+    # Short structured tasks: low effort keeps latency and cost down; raise for harder kinds.
+    effort: str = "low"  # low | medium | high | xhigh | max
+    refusal_fallbacks: bool = True  # server-side fallback on safety declines
+    max_retries: int = 2
+    max_context_tokens_per_agent: int = 6000
+    max_output_tokens_per_request: int = 2048
+    token_budget_per_agent_window: int = 100000
     budget_window_seconds: int = 3600
-    temperature: float = 0.1
+    temperature: float = 0.1  # used by the mock only; current Claude models reject sampling params
     request_timeout_seconds: float = 120.0
 
 
@@ -123,12 +122,14 @@ def load_config(path: str | os.PathLike | None = None, **overrides: Any) -> Conf
 def validate(cfg: Config) -> None:
     g = cfg.governor
     if g.model_instances != 1:
-        raise ValueError("exactly one resident model instance is supported")
+        raise ValueError("exactly one shared model is supported")
     if g.inference_concurrency < 1:
         raise ValueError("inference_concurrency must be >= 1")
     if not 1 <= g.default_active_agents <= g.maximum_active_agents:
         raise ValueError("default_active_agents must be within 1..maximum_active_agents")
     if cfg.security.mode not in ("dev", "secure"):
         raise ValueError("security.mode must be 'dev' or 'secure'")
-    if cfg.inference.backend not in ("mock", "llama-cpp", "http"):
-        raise ValueError("inference.backend must be mock, llama-cpp or http")
+    if cfg.inference.backend not in ("anthropic", "mock"):
+        raise ValueError("inference.backend must be 'anthropic' or 'mock'")
+    if cfg.inference.effort not in ("low", "medium", "high", "xhigh", "max"):
+        raise ValueError("inference.effort must be low, medium, high, xhigh or max")

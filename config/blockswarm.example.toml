@@ -11,23 +11,24 @@ minimum_host_headroom_mib    = 1024
 default_active_agents        = 2
 maximum_active_agents        = 3       # only used when measurements permit
 preferred_guest_ram_mib      = 256     # reserved per active agent (Phase 2 microVM size)
-model_instances              = 1
-inference_concurrency        = 1
+model_instances              = 1       # one shared model for all agents
+inference_concurrency        = 1       # API requests in flight at once
 enforce_limits               = true
 
 [inference]
-backend    = "llama-cpp"               # mock | llama-cpp | http
-model_path = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-n_ctx      = 2048
-n_threads  = 0                         # 0 = llama.cpp default
-max_context_tokens_per_agent  = 1536
-max_output_tokens_per_request = 256
-token_budget_per_agent_window = 20000
+# Claude through the Anthropic API. Credentials come from the SDK's normal
+# resolution (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or `ant auth login`),
+# never from this file.
+backend           = "anthropic"        # anthropic | mock
+model             = "claude-opus-5-5"
+effort            = "low"              # low | medium | high | xhigh | max
+refusal_fallbacks = true               # server-side fallback on safety declines
+max_retries       = 2
+request_timeout_seconds       = 120
+max_context_tokens_per_agent  = 6000   # estimated prompt tokens per request
+max_output_tokens_per_request = 2048
+token_budget_per_agent_window = 100000
 budget_window_seconds         = 3600
-# backend = "http" talks to an OpenAI-compatible endpoint: a local
-# `llama-server` (one resident model) or an optional remote model (https only).
-http_url   = "http://127.0.0.1:8080/v1/chat/completions"
-http_api_key_env = "BLOCKSWARM_REMOTE_API_KEY"
 
 [security]
 mode            = "dev"                # "secure" refuses to run without microVMs

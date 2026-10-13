@@ -63,6 +63,25 @@ class TwoAgentPrototypeTests(SwarmTestCase, unittest.TestCase):
             self.assertNotEqual(s.result(tid)["agent_id"], bad)
         self.assertEqual(s.registry.get(bad).status, "quarantined")
 
+    def test_model_service_outage_does_not_blame_agents(self):
+        from blockswarm.inference import ServiceUnavailable
+        s = self.swarm
+        real = s.backend.complete
+        calls = {"n": 0}
+
+        def flaky(*args):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise ServiceUnavailable("Anthropic API error 529")
+            return real(*args)
+        s.backend.complete = flaky
+        tid = s.submit("classify_sentiment", {"text": "great"}, max_attempts=3)
+        asyncio.run(s.run(timeout=10))
+        self.assertEqual(s.queue.get(tid).status, "done")
+        self.assertEqual(s.queue.get(tid).excluded, [])
+        for a in s.registry.list():
+            self.assertEqual((a.status, a.failures), ("idle", 0))
+
     def test_tampered_output_is_rejected_by_verifier(self):
         s = self.swarm
         original = s.signer.sign_as_agent
@@ -144,7 +163,7 @@ class SecurityModeTests(unittest.TestCase):
     def test_secure_mode_refuses_inprocess_sandbox(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(home=tmp, security={"mode": "secure"})
+            cfg = load_config(home=tmp, security={"mode": "secure"}, inference={"backend": "mock"})
             with self.assertRaises(SecurityPolicyError):
                 Swarm(cfg)
 
@@ -152,7 +171,8 @@ class SecurityModeTests(unittest.TestCase):
         import tempfile
         from blockswarm.sandbox import SandboxUnavailable
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(home=tmp, security={"mode": "secure", "sandbox_backend": "firecracker"})
+            cfg = load_config(home=tmp, inference={"backend": "mock"},
+                              security={"mode": "secure", "sandbox_backend": "firecracker"})
             s = Swarm(cfg)
             s.create_agents(1)
             tid = s.submit("classify_sentiment", {"text": "x"}, max_attempts=1)

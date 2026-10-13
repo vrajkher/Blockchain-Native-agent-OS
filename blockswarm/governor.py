@@ -59,7 +59,7 @@ class ResourceGovernor:
                  extra_pids: list[int] | None = None):
         self.cfg = cfg
         self._meminfo = meminfo
-        self._extra_pids = extra_pids or []  # e.g. an external llama-server
+        self._extra_pids = extra_pids or []  # e.g. a co-located helper process
         self._app_rss = app_rss or self._measure_app_rss
         self.last: MemorySample | None = None
 

@@ -129,12 +129,16 @@ class TaskQueue:
             (commitment, time.time(), task_id, agent_id))
         return cur.rowcount == 1
 
-    def fail(self, task_id: str, agent_id: str, error: str, retryable: bool = True) -> str:
-        """Release a failed lease. Returns the new status."""
+    def fail(self, task_id: str, agent_id: str, error: str, retryable: bool = True,
+             blame_agent: bool = True) -> str:
+        """Release a failed lease. Returns the new status.
+
+        ``blame_agent=False`` (infrastructure failures) lets the same agent retry.
+        """
         task = self.get(task_id)
         if task is None or task.status != "leased" or task.lease_owner != agent_id:
             return task.status if task else "missing"
-        excluded = sorted(set(task.excluded) | {agent_id})
+        excluded = sorted(set(task.excluded) | ({agent_id} if blame_agent else set()))
         started = self.db.one("SELECT 1 FROM execution_log WHERE idempotency_key=?",
                               (f"exec:{task_id}",)) is not None
         if task.irreversible and started:

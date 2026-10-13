@@ -1,11 +1,12 @@
 # BlockSwarm AI Lite
 
-A CPU-only, blockchain-native, parallel AI agent swarm runtime for small
+A lightweight, blockchain-native, parallel AI agent swarm runtime for small
 Linux hosts (target: 8 GB RAM, no GPU).
 
-Many **logical agent identities** (100+) share **one resident quantized
-model** (llama.cpp GGUF). By default two agents are active at once, three
-only when measured memory permits. Every agent has a cryptographic identity,
+Many **logical agent identities** (100+) share **one AI model served through
+the Anthropic API** (Claude, default `claude-opus-5-5`). No model weights run
+on the host. By default two agents are active at once, three only when
+measured memory permits. Every agent has a cryptographic identity,
 private scoped memory, short-lived scoped capabilities, signed task
 envelopes and signed result commitments, and its results are batched into
 Merkle-rooted ledger blocks.
@@ -23,8 +24,8 @@ Merkle-rooted ledger blocks.
 | Signed task envelopes, replay protection (durable nonces), expiry | **Implemented** |
 | Short-lived, scoped, host-signed capabilities; policy outside agent control | **Implemented** |
 | Tool authorization gateway (fail-closed, rate-limited, audited) | **Implemented** (one tool: calculator) |
-| One shared model via llama.cpp, per-agent context/token limits, concurrency 1 | **Implemented** (tested with a synthetic model, see below) |
-| Optional remote / `llama-server` model adapter (OpenAI-compatible HTTP) | **Implemented**, not exercised in CI |
+| One shared model via the Anthropic API (official SDK), structured outputs, refusal fallbacks | **Implemented**; tested against a local fake API, **not yet against the live API** |
+| Per-agent context/token limits, request concurrency 1, startup credential preflight | **Implemented** |
 | Asyncio scheduler, SQLite WAL durable queue, dependency graphs, leases, retries | **Implemented** |
 | No duplicate irreversible execution (idempotency log → `needs_review`) | **Implemented** |
 | Agent checkpoint / suspend / recycle, quarantine, revocation, emergency kill | **Implemented** |
@@ -45,29 +46,27 @@ Requires Python 3.11+ on Linux x86-64.
 ```bash
 git clone <this repo> && cd Blockchain-Native-agent-OS
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .                       # runtime: only `cryptography`
-pip install -e '.[llama]'              # + llama.cpp (builds from source, CPU only)
-# optional, for a reproducible CPU-portable build:
-# CMAKE_ARGS="-DGGML_NATIVE=OFF" pip install llama-cpp-python
+pip install -e .                       # runtime: `cryptography` + `anthropic`
+export ANTHROPIC_API_KEY=sk-ant-...    # or: ant auth login
 ```
 
-Get a small GGUF model (0.5B to 1.5B, 4-bit), for example Qwen2.5-0.5B-Instruct Q4_K_M:
-
-```bash
-mkdir -p models
-curl -L -o models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
-```
+Credentials are resolved by the Anthropic SDK (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile). They are never stored
+in the swarm config, and agents never see them. `demo` and `serve` check
+credentials and the model ID at startup and exit with a clear message if
+either is wrong.
 
 ## Quick start
 
 ```bash
-# Two-agent demo with the deterministic MOCK backend (no model needed)
+# Two-agent demo using Claude through the Anthropic API (the default; makes real API calls)
 python -m blockswarm demo --fresh
 
-# Same demo with a real model through llama.cpp
-python -m blockswarm demo --fresh --backend llama-cpp \
-    --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+# Pick a model / effort (defaults: claude-opus-5-5, effort low)
+python -m blockswarm demo --fresh --model claude-opus-5-5 --effort medium
+
+# Offline demo with the deterministic MOCK backend (no API calls)
+python -m blockswarm demo --fresh --backend mock
 
 python -m blockswarm status                  # swarm, queue, ledger, memory state
 python -m blockswarm revoke <agent_id>       # revoke identity (sealed on the ledger)
@@ -103,15 +102,10 @@ python -m unittest discover -s tests -t .     # or: pytest
 
 ```bash
 python scripts/bench.py --backend mock --agents 2 3 10 100 --tasks 30
-python scripts/bench.py --backend llama-cpp --model models/<model>.gguf --agents 2 3 10 100
+python scripts/bench.py --backend anthropic --agents 2 3 10 100 --tasks 6   # real API calls, costs money
 ```
 
-No model weights could be downloaded in the environment used to build Phase
-1, so `scripts/make_synthetic_gguf.py` generates a model with the exact
-tensor shapes of Qwen2.5-0.5B, quantized to Q4_K_M by llama.cpp. Its
-**weights are random, so its output text is meaningless**. It is useful only
-to measure memory and CPU latency. Results are in
-[docs/PHASE1_REPORT.md](docs/PHASE1_REPORT.md).
+Results are in [docs/PHASE1_REPORT.md](docs/PHASE1_REPORT.md).
 
 ## Layout
 
@@ -123,7 +117,7 @@ blockswarm/
   capabilities.py  short-lived scoped capabilities, role → scope policy
   envelope.py      signed task envelopes, result records
   nonces.py        durable replay protection
-  inference.py     one shared model: llama.cpp / HTTP / MOCK; limits; concurrency
+  inference.py     one shared model: Anthropic API (Claude) / MOCK; limits; concurrency
   harness.py       per-agent lightweight AI harness (runs inside the sandbox)
   memory.py        private agent-scoped memory (zlib for large values)
   tools.py         external tool authorization gateway
@@ -136,7 +130,7 @@ blockswarm/
   api.py           minimal authenticated HTTP API
   cli.py           command line
 docs/              architecture and phase reports
-scripts/           benchmark and synthetic-model tools
+scripts/           benchmark tool
 tests/             unit, integration and security tests
 ```
 
@@ -149,6 +143,9 @@ tests/             unit, integration and security tests
 * `security.mode = "secure"` fails closed: the runtime refuses to start
   unless a microVM sandbox backend is configured, and the Firecracker backend
   refuses to run until Phase 2 implements it.
+* Task inputs (and dependency outputs fed into later tasks) are sent to the
+  Anthropic API. Each request carries only the calling agent's own prompt;
+  there is no shared conversation state between agents.
 * Private keys stay in the host keystore (directory 0700, files 0600,
   optional passphrase encryption via `BLOCKSWARM_KEYSTORE_PASSPHRASE`).
 * No sandbox technology guarantees absolute containment.

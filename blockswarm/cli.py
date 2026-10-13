@@ -19,17 +19,24 @@ def _cfg(args):
     if getattr(args, "backend", None):
         inf["backend"] = args.backend
     if getattr(args, "model", None):
-        inf["model_path"] = args.model
-    if getattr(args, "threads", None):
-        inf["n_threads"] = args.threads
+        inf["model"] = args.model
+    if getattr(args, "effort", None):
+        inf["effort"] = args.effort
     if inf:
         overrides["inference"] = inf
     return load_config(args.config, **overrides)
 
 
-def _swarm(cfg):
+def _swarm(cfg, preflight: bool = False):
+    from .inference import InferenceError
     from .swarm import Swarm
-    return Swarm(cfg)
+    swarm = Swarm(cfg)
+    if preflight:
+        try:
+            swarm.backend.preflight()
+        except InferenceError as exc:
+            raise SystemExit(f"inference backend not ready: {exc}")
+    return swarm
 
 
 def _ensure_agents(swarm, n: int) -> None:
@@ -61,7 +68,7 @@ def cmd_demo(args) -> int:
         shutil.rmtree(cfg.home_path)
     rss0 = rss_bytes()
     t0 = time.perf_counter()
-    swarm = _swarm(cfg)
+    swarm = _swarm(cfg, preflight=True)
     rss_loaded = rss_bytes()
     _ensure_agents(swarm, args.agents)
     from .demo import submit_demo_graph
@@ -73,7 +80,9 @@ def cmd_demo(args) -> int:
 
     ids, status = asyncio.run(main())
     elapsed = time.perf_counter() - t0
-    print(f"backend={swarm.backend.name} mock={swarm.backend.is_mock} isolation={swarm.sandboxes.isolation}")
+    model = "" if swarm.backend.is_mock else f" model={cfg.inference.model} effort={cfg.inference.effort}"
+    print(f"backend={swarm.backend.name}{model} mock={swarm.backend.is_mock} "
+          f"isolation={swarm.sandboxes.isolation}")
     print(f"ledger={status['ledger']['backend']} finality={status['ledger']['finality']}")
     ok = True
     for name, tid in ids.items():
@@ -98,7 +107,7 @@ def cmd_demo(args) -> int:
         "inference_requests": status["inference"]["requests"],
         "ledger_height": status["ledger"]["height"], "chain_valid": swarm.chain.ledger.verify_chain(),
         "elapsed_s": round(elapsed, 2),
-        "rss_mib": {"start": round(rss0 / 2**20, 1), "after_model_load": round(rss_loaded / 2**20, 1),
+        "rss_mib": {"start": round(rss0 / 2**20, 1), "after_init": round(rss_loaded / 2**20, 1),
                     "end": round(rss_bytes() / 2**20, 1), "peak": round(peak_rss_bytes() / 2**20, 1)},
         "host_mem_available_mib": round(read_meminfo()["MemAvailable"] / 2**20),
     }, indent=2))
@@ -124,7 +133,7 @@ def cmd_revoke(args) -> int:
 def cmd_serve(args) -> int:
     from .api import ApiServer, load_or_create_token
     cfg = _cfg(args)
-    swarm = _swarm(cfg)
+    swarm = _swarm(cfg, preflight=True)
     _ensure_agents(swarm, args.agents)
     token = load_or_create_token(cfg.home_path)
 
@@ -149,9 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def backend_args(sp):
-        sp.add_argument("--backend", choices=["mock", "llama-cpp", "http"])
-        sp.add_argument("--model", help="path to a GGUF model (llama-cpp backend)")
-        sp.add_argument("--threads", type=int)
+        sp.add_argument("--backend", choices=["anthropic", "mock"])
+        sp.add_argument("--model", help="Claude model ID (default claude-opus-5-5)")
+        sp.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
 
     sp = sub.add_parser("init")
     sp.add_argument("--agents", type=int, default=2)

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blockswarm-lite"
+version = "0.1.0"
+description = "BlockSwarm AI Lite: CPU-only, blockchain-native parallel AI agent swarm runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["cryptography>=42"]
+
+[project.optional-dependencies]
+llama = ["llama-cpp-python>=0.3"]
+dev = ["pytest>=8", "gguf>=0.10", "numpy>=1.26"]
+
+[project.scripts]
+blockswarm = "blockswarm.cli:main"
+
+[tool.setuptools]
+packages = ["blockswarm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

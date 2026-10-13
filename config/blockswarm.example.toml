@@ -1,0 +1,47 @@
+# BlockSwarm AI Lite example configuration.
+# Memory values are starting targets; the governor measures real RSS and
+# MemAvailable and reduces concurrency before risking host exhaustion.
+
+home = ".blockswarm"
+
+[governor]
+total_physical_ram_target_mib = 8192   # 0 = use the host's real total
+target_application_ram_mib   = 5120
+minimum_host_headroom_mib    = 1024
+default_active_agents        = 2
+maximum_active_agents        = 3       # only used when measurements permit
+preferred_guest_ram_mib      = 256     # reserved per active agent (Phase 2 microVM size)
+model_instances              = 1
+inference_concurrency        = 1
+enforce_limits               = true
+
+[inference]
+backend    = "llama-cpp"               # mock | llama-cpp | http
+model_path = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+n_ctx      = 2048
+n_threads  = 0                         # 0 = llama.cpp default
+max_context_tokens_per_agent  = 1536
+max_output_tokens_per_request = 256
+token_budget_per_agent_window = 20000
+budget_window_seconds         = 3600
+# backend = "http" talks to an OpenAI-compatible endpoint: a local
+# `llama-server` (one resident model) or an optional remote model (https only).
+http_url   = "http://127.0.0.1:8080/v1/chat/completions"
+http_api_key_env = "BLOCKSWARM_REMOTE_API_KEY"
+
+[security]
+mode            = "dev"                # "secure" refuses to run without microVMs
+sandbox_backend = "inprocess"          # "firecracker" arrives in Phase 2
+capability_ttl_seconds = 300
+envelope_ttl_seconds   = 300
+max_agent_failures     = 3
+task_timeout_seconds   = 180
+lease_seconds          = 240
+
+[ledger]
+backend    = "simulated"               # local hash-chained log; NO consensus
+batch_size = 16
+
+[api]
+host = "127.0.0.1"
+port = 8787

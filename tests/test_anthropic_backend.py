@@ -136,8 +136,8 @@ class AnthropicBackendTests(unittest.TestCase):
             return Completion(text, p, c, "anthropic", False, 0.0)
 
         class Mem:
-            def recent(self, n): return []
-            def put(self, k, v): pass
+            async def recent(self, n): return []
+            async def put(self, k, v): pass
 
         from blockswarm.tasks import KINDS as K
         harness = AgentHarness(AgentContext("bsa1x", "00", Mem(), infer, None))

@@ -39,7 +39,7 @@ def run_one(args) -> dict:
         inf = {"backend": args.backend, "max_output_tokens_per_request": args.max_tokens}
         if args.model:
             inf["model"] = args.model
-        cfg = load_config(home=home, inference=inf,
+        cfg = load_config(home=home, inference=inf, security={"sandbox_backend": args.sandbox},
                           governor={"maximum_active_agents": args.max_active,
                                     "default_active_agents": min(2, args.max_active)})
         t_load = time.perf_counter()
@@ -74,7 +74,10 @@ def run_one(args) -> dict:
         agents_used = len({r["agent_id"] for r in
                            swarm.db.all("SELECT agent_id FROM results")})
         out = {
-            "backend": args.backend, "logical_agents": args.agents, "tasks": args.tasks,
+            "backend": args.backend, "sandbox": args.sandbox,
+            "logical_agents": args.agents, "tasks": args.tasks,
+            "guest_peak_rss_mib": round(swarm.guest_peak_rss / 2**20, 1) or None,
+            "ms_per_task": round(1000 * elapsed / args.tasks, 1),
             "tasks_status": status["tasks"], "agents_used": agents_used,
             "max_active_seen": status["max_active_seen"],
             "allowed_active_seen": sorted(swarm.allowed_seen),
@@ -104,6 +107,7 @@ def main() -> None:
     ap.add_argument("--tasks", type=int, default=12)
     ap.add_argument("--max-active", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=1024)
+    ap.add_argument("--sandbox", default="inprocess", choices=["inprocess", "process", "firecracker"])
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--child", action="store_true")
     args = ap.parse_args()
@@ -115,7 +119,7 @@ def main() -> None:
     for n in args.agents:
         cmd = [sys.executable, os.path.abspath(__file__), "--child", "--backend", args.backend,
                "--agents", str(n), "--tasks", str(args.tasks), "--max-active", str(args.max_active),
-               "--max-tokens", str(args.max_tokens),
+               "--max-tokens", str(args.max_tokens), "--sandbox", args.sandbox,
                "--timeout", str(args.timeout)]
         if args.model:
             cmd += ["--model", args.model]

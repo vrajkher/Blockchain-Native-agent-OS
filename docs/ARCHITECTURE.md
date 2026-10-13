@@ -20,31 +20,71 @@
 ## Components and trust boundaries
 
 ```
-                     HOST (trusted)                                     │  AGENT (untrusted)
-┌──────────────────────────────────────────────────────────────────┐   │  ┌───────────────────────┐
-│ Scheduler (asyncio) ── TaskQueue (SQLite WAL, leases, deps)       │   │  │ AgentHarness           │
-│   │        ResourceGovernor (/proc/meminfo, RSS → 0..3 active)    │   │  │  - verifies envelope   │
-│   │                                                               │   │  │  - builds prompt       │
-│   ├─ CapabilityAuthority ── policy: role → scopes (host-only)     │   │  │  - parses/normalizes   │
-│   ├─ SigningService (keystore 0700; host + agent keys)            │   │  │  - private memory view │
-│   ├─ envelope: sign task, consume nonce (replay gate)  ───────────┼──►│  │                        │
-│   │                                                               │   │  │  infer(msgs) ──────────┼──┐
-│   │  InferenceService ◄── capability check, per-agent limits ◄────┼───┼──┼────────────────────────┘  │
-│   │   └─ one Backend: Anthropic API (official SDK) | MOCK         │   │  │  call_tool(name,args) ─┼──┐
-│   │  ToolGateway ◄── capability check, rate limit, audit ◄────────┼───┼──┼────────────────────────┘  │
-│   │                                                               │   │  └───────────────────────┘
-│   ├─ sign result record AS the agent (key never leaves host)      │   │   Phase 1: in-process task
-│   ├─ DeterministicVerifier (sigs, commitments, schema, perms,     │   │   Phase 2: Firecracker
-│   │                         evidence, kind checkers)              │   │   microVM + jailer, vsock
-│   └─ BlockchainRuntime → SimulatedLedger (Merkle-batched blocks)  │   │
-└──────────────────────────────────────────────────────────────────┘
+                         HOST (trusted)                                    │ SANDBOX (untrusted)
+┌─────────────────────────────────────────────────────────────────────┐    │ one per task run
+│ Scheduler (asyncio) ─ TaskQueue (SQLite WAL) ─ ResourceGovernor     │    │ ┌──────────────────────┐
+│   ├─ CapabilityAuthority: issue scoped, short-lived capability      │    │ │ guest agent          │
+│   ├─ SigningService (keystore 0700): sign envelope / result         │    │ │  AgentHarness        │
+│   │                                                                 │    │ │  - verifies envelope │
+│   │  SandboxBroker (one per run) ◄══ framed JSON RPC ═══════════════╪════╪═╡  - prompt / parse    │
+│   │   - sends task (envelope, payload, host pubkey); NO capability  │    │ │  RPC stubs:          │
+│   │   - every request ─► AuthorizationGateway ─► allow / deny       │    │ │  infer, tool, memory │
+│   │        (capability + registry status + policy file + limits)    │    │ └──────────────────────┘
+│   │        in-process, or a separate process on a 0600 Unix socket  │    │ transport:
+│   │   - inference ─► InferenceService ─► Anthropic API              │    │  inprocess: socketpair
+│   │   - tools     ─► ToolGateway (host-side execution)              │    │  process:   inherited fd
+│   │   - memory    ─► this agent's MemoryView only                   │    │  firecracker: virtio-vsock
+│   │   - records evidence itself (tool calls, tokens, mock flag)     │    │   (host side: Unix socket
+│   ├─ DeterministicVerifier                                          │    │    in this VM's jail)
+│   └─ BlockchainRuntime ─► SimulatedLedger (Merkle-batched blocks)   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-In Phase 1 the right-hand side runs as an asyncio task in the same process,
-so the boundary is enforced only by the API surface. Phase 2 moves the
-harness into a microVM and turns `infer` / `call_tool` into vsock RPC stubs
-that reach `POST /v1/inference` and the tool gateway. The host-side checks
-are already the ones that will be used then.
+The guest holds nothing of value: no keys, no capability, no API
+credentials, no database handle. The host decides every action, and the
+guest can only ask.
+
+### Sandbox backends
+
+| Backend | What separates the guest from the host |
+|---|---|
+| `inprocess` | Nothing but the RPC API (same process). Dev only. |
+| `process` | Separate process: `setsid`, uid/gid 65534, no supplementary groups, empty environment, `-I` isolated Python, rlimits (CPU seconds, address space, 32 fds, **zero file-size**, no core dumps) and, when root, a fresh network namespace (no interfaces up, so no network). Shares the host kernel and can read world-readable files. Dev only. |
+| `firecracker` | One microVM per run, started by `jailer` as uid/gid 65534 in a chroot with cgroup `cpu`/`memory`/`pids` limits and Firecracker's seccomp filters. Own guest kernel; root filesystem attached **read-only**; tmpfs scratch; **no network interface**. The only device to the outside is virtio-vsock: the guest connects to CID 2 port 5000, which Firecracker maps to `v.sock_5000` inside that VM's jail, where the broker for that run listens. VMs cannot reach each other (no NIC, separate vsock devices, separate jails). Destroyed after the run. |
+
+### Broker protocol
+
+Frames are a 4-byte big-endian length plus a UTF-8 JSON object (max 256 KiB).
+
+```
+host → guest   {"t":"task", agent_id, host_pubkey, envelope, payload}
+guest → host   {"t":"call", id, op: infer|tool|mem.get|mem.recent|mem.put, args}
+host → guest   {"t":"reply", id, ok, value | error}
+guest → host   {"t":"result", output} | {"t":"fail", error}
+```
+
+Per-run limits are 32 calls by default, the frame size cap and the task
+timeout. A denied action or an unknown op gets an error reply. A malformed
+or oversized frame, an unexpected message type, a non-object output or
+exceeding a limit ends the run as a failure attributed to the agent. A
+model-service outage reported through the broker is not attributed to the
+agent.
+
+### Authorization gateway
+
+Decision for (agent, action, argument size):
+
+1. agent is registered and not revoked or quarantined;
+2. the host-signed capability is valid, unexpired, bound to this agent and
+   includes the action's scope;
+3. the policy file grants the action to one of the agent's roles (deny by
+   default);
+4. the argument size is within the rule's limit;
+5. the per-agent, per-action rate limit is not exceeded.
+
+Any exception denies. Every decision is audited (SQLite audit table
+in-process, JSONL file in the external process). The policy's digest is
+anchored on the ledger when it changes.
 
 ## Task lifecycle
 
@@ -59,21 +99,24 @@ are already the ones that will be used then.
    the nonce.
 4. Irreversible tasks insert an idempotency key first. If it already exists,
    the task goes to `needs_review` and is never executed twice automatically.
-5. Harness runs in the sandbox with a timeout. LLM kinds call Claude with
+5. A fresh sandbox is created for the run. The broker sends the task, and the
+   guest harness verifies the envelope and does the work, asking the broker
+   (and through it the gateway) for every inference call, tool call and
+   memory access. LLM kinds call Claude with
    structured outputs (`output_config.format` = the task's JSON schema) and
    one repair round. Model-service failures (credentials, network, rate
    limits, 5xx) are retried without being counted against the agent.
 6. Host builds the result record (`H(envelope)`, `H(output)`,
-   `H(tool_calls)`), signs it with the agent's key, and verifies everything
-   deterministically.
+   `H(tool_calls)` where tool calls are the ones the *broker* executed), signs
+   it with the agent's key, and verifies everything deterministically.
 7. On success: `commit_result_hash` + host `submit_attestation`; result row and
    `done` status written in one transaction guarded by lease ownership. After
    the batch is sealed, the Merkle receipt is attached to the result.
 8. On failure: lease released; retry on a different agent up to
    `max_attempts`; agent failure counter incremented (quarantine at the
    threshold); dependents of permanently failed tasks fail.
-9. Agent checkpointed and suspended (status `idle`, cached key dropped,
-   sandbox discarded).
+9. Sandbox destroyed (VM or process killed, jail removed). Agent checkpointed
+   and suspended (status `idle`, cached key dropped).
 
 ## Ledger and receipts
 

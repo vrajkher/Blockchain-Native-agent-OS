@@ -1,10 +1,10 @@
 """Lightweight per-agent AI harness.
 
 Each agent gets its own harness instance holding only: its identity, the
-host public key, its private memory view, and two bound clients (inference
-and tool gateway) that carry its own short-lived capability. It never holds
-private keys, the database, or references to other agents. In Phase 2 this
-module is what runs inside the microVM, with the clients becoming RPC stubs.
+host public key, and RPC stubs (inference, tools, private memory) that reach
+the host broker. It never holds private keys, capabilities, the database,
+or references to other agents. It runs inside the sandbox via
+``blockswarm.guest.agent``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable
 
 from . import schema
 from .envelope import check_task_envelope
-from .memory import AgentMemoryView
 from .tasks import KINDS, TaskKind
 
 
@@ -27,7 +26,7 @@ class HarnessError(Exception):
 class AgentContext:
     agent_id: str
     host_pubkey: str
-    memory: AgentMemoryView
+    memory: Any  # async get/put/recent; backed by the broker over RPC
     infer: Callable[[list[dict], dict | None], Awaitable[Any]]
     call_tool: Callable[[str, dict], Awaitable[Any]]
 
@@ -93,8 +92,8 @@ class AgentHarness:
             raise HarnessError(f"invalid task input: {errors}")
         result = await (self._run_llm(kind, payload) if kind.uses_llm
                         else self._run_tool(kind, payload))
-        self.ctx.memory.put(f"task:{body['task_id']}",
-                            json.dumps({"kind": kind.name, "output": result.output})[:2000])
+        await self.ctx.memory.put(f"task:{body['task_id']}",
+                                  json.dumps({"kind": kind.name, "output": result.output})[:2000])
         return result
 
     async def _run_tool(self, kind: TaskKind, payload: dict) -> HarnessResult:
@@ -104,8 +103,8 @@ class AgentHarness:
         return HarnessResult({"answer": res["value"]},
                              tool_calls=[{"tool": "calculator", "args": payload}])
 
-    def _messages(self, kind: TaskKind, payload: dict) -> list[dict]:
-        notes = self.ctx.memory.recent(2)
+    async def _messages(self, kind: TaskKind, payload: dict) -> list[dict]:
+        notes = await self.ctx.memory.recent(2)
         note_text = "".join(f"\n- {v[:200]}" for _, v in notes)
         system = (
             f"TASK_KIND: {kind.name}\n"
@@ -119,7 +118,7 @@ class AgentHarness:
                 {"role": "user", "content": "Input:\n" + json.dumps(payload, ensure_ascii=False)}]
 
     async def _run_llm(self, kind: TaskKind, payload: dict) -> HarnessResult:
-        messages = self._messages(kind, payload)
+        messages = await self._messages(kind, payload)
         calls = tokens = 0
         mock = False
         last_error = "no attempt"

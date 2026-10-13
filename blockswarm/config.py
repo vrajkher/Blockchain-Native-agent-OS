@@ -49,7 +49,14 @@ class SecurityConfig:
     # dev: in-process sandbox allowed (NOT a security boundary)
     # secure: microVM isolation required; startup fails closed otherwise
     mode: str = "dev"
-    sandbox_backend: str = "inprocess"  # inprocess | firecracker
+    sandbox_backend: str = "inprocess"  # inprocess | process | firecracker
+    # process sandbox (dev): uid to drop to when started as root, address-space cap
+    process_uid: int = 65534
+    process_memory_mib: int = 1024
+    # authorization gateway: "inprocess" or "unix:/path/to/gateway.sock"
+    gateway: str = "inprocess"
+    policy_file: str = ""  # empty = built-in default policy
+    max_rpc_calls_per_task: int = 32
     capability_ttl_seconds: int = 300
     envelope_ttl_seconds: int = 300
     max_agent_failures: int = 3
@@ -57,6 +64,26 @@ class SecurityConfig:
     lease_seconds: float = 240.0
     max_memory_entries_per_agent: int = 200
     max_memory_value_bytes: int = 16384
+
+
+@dataclass
+class FirecrackerConfig:
+    firecracker_bin: str = "/usr/local/bin/firecracker"
+    jailer_bin: str = "/usr/local/bin/jailer"
+    kernel_image: str = "/var/lib/blockswarm/vmlinux"
+    rootfs_image: str = "/var/lib/blockswarm/guest-rootfs.ext4"
+    chroot_base: str = "/srv/blockswarm-jail"
+    uid: int = 65534  # unprivileged user firecracker runs as inside the jail
+    gid: int = 65534
+    vcpus: int = 1
+    guest_mem_mib: int = 256
+    vmm_overhead_mib: int = 64  # cgroup memory limit = guest + overhead
+    cpu_quota_pct: int = 100  # of one CPU
+    pids_max: int = 64
+    cgroup_version: int = 2
+    vsock_port: int = 5000
+    boot_timeout_seconds: float = 30.0
+    boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off ro quiet init=/sbin/blockswarm-init"
 
 
 @dataclass
@@ -79,6 +106,7 @@ class Config:
     governor: GovernorConfig = field(default_factory=GovernorConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    firecracker: FirecrackerConfig = field(default_factory=FirecrackerConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
 
@@ -131,5 +159,9 @@ def validate(cfg: Config) -> None:
         raise ValueError("security.mode must be 'dev' or 'secure'")
     if cfg.inference.backend not in ("anthropic", "mock"):
         raise ValueError("inference.backend must be 'anthropic' or 'mock'")
+    if cfg.security.sandbox_backend not in ("inprocess", "process", "firecracker"):
+        raise ValueError("security.sandbox_backend must be inprocess, process or firecracker")
+    if cfg.firecracker.cgroup_version not in (1, 2):
+        raise ValueError("firecracker.cgroup_version must be 1 or 2")
     if cfg.inference.effort not in ("low", "medium", "high", "xhigh", "max"):
         raise ValueError("inference.effort must be low, medium, high, xhigh or max")

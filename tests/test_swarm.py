@@ -167,20 +167,21 @@ class SecurityModeTests(unittest.TestCase):
             with self.assertRaises(SecurityPolicyError):
                 Swarm(cfg)
 
-    def test_secure_mode_firecracker_not_yet_available_fails_closed(self):
+    def test_secure_mode_without_kvm_refuses_to_dispatch(self):
         import tempfile
         from blockswarm.sandbox import SandboxUnavailable
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(home=tmp, inference={"backend": "mock"},
-                              security={"mode": "secure", "sandbox_backend": "firecracker"})
+                              security={"mode": "secure", "sandbox_backend": "firecracker"},
+                              firecracker={"kernel_image": "/nonexistent/vmlinux"})
             s = Swarm(cfg)
             s.create_agents(1)
             tid = s.submit("classify_sentiment", {"text": "x"}, max_attempts=1)
-            asyncio.run(s.run(timeout=10))
-            self.assertIn("SandboxUnavailable", s.queue.get(tid).error)
-            self.assertIsNone(s.result(tid))
+            with self.assertRaisesRegex(SandboxUnavailable, "kernel"):
+                asyncio.run(s.run(timeout=10))
+            # Nothing was dispatched: the task is untouched and can run once KVM exists.
+            self.assertEqual((s.queue.get(tid).status, s.queue.get(tid).attempts), ("pending", 0))
             asyncio.run(s.shutdown())
-            self.assertTrue(issubclass(SandboxUnavailable, RuntimeError))
 
 
 class ApiTests(SwarmTestCase, unittest.TestCase):

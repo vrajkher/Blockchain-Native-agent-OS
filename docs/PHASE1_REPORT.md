@@ -1,5 +1,7 @@
 # Phase 1 report: two-agent prototype
 
+> Superseded in part by [PHASE2_REPORT.md](PHASE2_REPORT.md) (sandboxes, gateway).
+
 **Goal:** a runnable two-agent prototype using one shared AI model, SQLite
 and asyncio, with the security, identity and ledger interfaces of the full
 architecture already in place.

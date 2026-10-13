@@ -32,12 +32,34 @@ budget_window_seconds         = 3600
 
 [security]
 mode            = "dev"                # "secure" refuses to run without microVMs
-sandbox_backend = "inprocess"          # "firecracker" arrives in Phase 2
+sandbox_backend = "process"            # inprocess | process | firecracker (secure mode)
+gateway         = "inprocess"          # or "unix:/run/blockswarm/gateway.sock" (external process)
+policy_file     = "config/policy.example.toml"
+process_uid     = 65534                # process sandbox drops to this uid when run as root
+process_memory_mib     = 1024          # process sandbox address-space cap
+max_rpc_calls_per_task = 32
 capability_ttl_seconds = 300
 envelope_ttl_seconds   = 300
 max_agent_failures     = 3
 task_timeout_seconds   = 180
 lease_seconds          = 240
+
+[firecracker]                          # used when sandbox_backend = "firecracker"
+firecracker_bin = "/usr/local/bin/firecracker"
+jailer_bin      = "/usr/local/bin/jailer"
+kernel_image    = "/var/lib/blockswarm/vmlinux"            # scripts/build_guest_image.sh
+rootfs_image    = "/var/lib/blockswarm/guest-rootfs.ext4"  # attached read-only
+chroot_base     = "/srv/blockswarm-jail"
+uid = 65534
+gid = 65534
+vcpus           = 1
+guest_mem_mib   = 256
+vmm_overhead_mib = 64                  # cgroup memory limit = guest + overhead
+cpu_quota_pct   = 100                  # % of one CPU
+pids_max        = 64
+cgroup_version  = 2                    # 1 on cgroup-v1 hosts
+vsock_port      = 5000
+boot_timeout_seconds = 30
 
 [ledger]
 backend    = "simulated"               # local hash-chained log; NO consensus

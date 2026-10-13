@@ -14,7 +14,8 @@ from .config import Config
 from .db import Database
 from .envelope import RESULT_DOMAIN, accept_task_envelope, make_task_envelope, result_record
 from .governor import ResourceGovernor
-from .harness import AgentContext, AgentHarness
+from .broker import BrokerLimits, SandboxBroker, SandboxJob
+from .gateway import AuthorizationGateway, Policy, RemoteGateway
 from .inference import Backend, InferenceService, ServiceUnavailable, make_backend
 from .ledger import BlockchainRuntime, SimulatedLedger
 from .memory import MemoryStore
@@ -46,12 +47,14 @@ class Swarm:
                  governor: ResourceGovernor | None = None):
         self.cfg = cfg
         # Fail closed on security policy before anything else is created.
-        self.sandboxes = SandboxFactory(cfg.security)
+        self.sandboxes = SandboxFactory(cfg)
         cfg.home_path.mkdir(parents=True, exist_ok=True)
         self.db = Database(cfg.db_path)
         self.registry = AgentRegistry(self.db)
         self.signer = SigningService(cfg.keystore_path, is_revoked=self.registry.is_revoked)
         self.host_pubkey = self.signer.ensure_host_key()
+        # Public: lets an out-of-process gateway verify capabilities without the keystore.
+        (cfg.home_path / "host_pubkey").write_text(self.host_pubkey)
         self.nonces = NonceStore(self.db)
         self.authority = CapabilityAuthority(self.signer, self.host_pubkey, self.registry.is_revoked,
                                              cfg.security.capability_ttl_seconds)
@@ -62,6 +65,7 @@ class Swarm:
                                           cfg.governor.inference_concurrency)
         self.tools = ToolGateway(self.authority, self.db)
         self.chain = BlockchainRuntime(SimulatedLedger(self.db, cfg.ledger.batch_size), self.host_pubkey)
+        self.gateway = self._make_gateway()
         self.verifier = DeterministicVerifier(self.registry, self.host_pubkey)
         self.queue = TaskQueue(self.db)
         self.governor = governor or ResourceGovernor(cfg.governor)
@@ -71,7 +75,24 @@ class Swarm:
         self.max_active_seen = 0
         self.allowed_seen: set[int] = set()
         self.fault_injector: Callable[[str, Task], None] | None = None
+        self.guest_peak_rss = 0
         self._recover_after_crash()
+
+    def _make_gateway(self):
+        target = self.cfg.security.gateway
+        if target.startswith("unix:"):
+            return RemoteGateway(target[5:])
+        if target != "inprocess":
+            raise ValueError(f"unknown gateway {target!r}")
+        policy = Policy.load(self.cfg.security.policy_file or None)
+        last = self.chain.ledger.entries("policy")
+        if not last or last[-1]["policy_digest"] != policy.digest:
+            self.chain.record_policy(policy.digest, policy.version)
+
+        def agent_info(agent_id: str):
+            rec = self.registry.get(agent_id)
+            return (rec.status, rec.roles) if rec else None
+        return AuthorizationGateway(policy, self.authority, agent_info, self.db.audit)
 
     # -- identities -----------------------------------------------------
     def create_agents(self, n: int, roles: list[str] | None = None, prefix: str = "agent") -> list[str]:
@@ -180,6 +201,7 @@ class Swarm:
 
     async def run(self, until_idle: bool = True, timeout: float | None = None) -> dict:
         deadline = time.monotonic() + timeout if timeout else None
+        self.sandboxes.check()  # fail closed before dispatching anything
         try:
             while True:
                 self.queue.recover_expired()
@@ -221,7 +243,7 @@ class Swarm:
                 payload["dependencies"] = {d: {"output": self.result(d)["output"],
                                                "commitment": self.queue.get(d).commitment}
                                            for d in task.deps}
-            scopes = set(kind.required_caps) | set(task.required_caps)
+            scopes = set(kind.required_caps) | set(task.required_caps) | {"memory"}
             cap = self.authority.issue(aid, agent.roles, scopes, task.task_id,
                                        ttl=self.cfg.security.task_timeout_seconds + 30)
             self.chain.authorize_capability(cap.body)
@@ -233,20 +255,21 @@ class Swarm:
                 self.db.audit("duplicate_execution_blocked", aid, task.task_id)
                 return
 
-            ctx = AgentContext(
-                agent_id=aid, host_pubkey=self.host_pubkey, memory=self.memory.view(aid),
-                infer=lambda msgs, sch: self.inference.infer(cap, aid, msgs, json_schema=sch),
-                call_tool=lambda name, args: self.tools.call(cap, aid, name, args))
-            harness = AgentHarness(ctx)
-
-            async def body():
-                if self.fault_injector:
-                    self.fault_injector(aid, task)
-                return await harness.run(envelope, payload)
-
+            if self.fault_injector:
+                self.fault_injector(aid, task)
             sandbox = self.sandboxes.create(aid)
             self.running[aid].sandbox = sandbox
-            result = await sandbox.run(body, self.cfg.security.task_timeout_seconds)
+            broker = SandboxBroker(
+                SandboxJob(aid, task.task_id, self.host_pubkey, envelope, payload), cap,
+                self.gateway, self.inference, self.tools, self.memory.view(aid),
+                BrokerLimits(max_calls=self.cfg.security.max_rpc_calls_per_task))
+            try:
+                result = await sandbox.run(broker, self.cfg.security.task_timeout_seconds)
+            finally:
+                if broker.stats.denied:
+                    self.db.audit("sandbox_denials", aid, task.task_id, denied=broker.stats.denied)
+                if sandbox.guest_peak_rss:
+                    self.guest_peak_rss = max(self.guest_peak_rss, sandbox.guest_peak_rss)
 
             record = result_record(envelope, aid, result.output, result.tool_calls)
             signature = self.signer.sign_as_agent(aid, RESULT_DOMAIN, record)
@@ -354,7 +377,11 @@ class Swarm:
                           "requests": self.inference.requests,
                           "max_concurrent": self.inference.max_in_flight},
             "isolation": self.sandboxes.isolation,
+            "sandbox_backend": self.cfg.security.sandbox_backend,
             "security_mode": self.cfg.security.mode,
+            "gateway": {"target": self.cfg.security.gateway,
+                        "policy": self.gateway.policy.digest, **self.gateway.decisions},
+            "guest_peak_rss_mib": round(self.guest_peak_rss / 2**20, 1) or None,
             "ledger": {"backend": "simulated", "finality": self.chain.ledger.finality,
                        "consensus": self.chain.ledger.consensus,
                        "height": tip["height"] if tip else None,

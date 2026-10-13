@@ -1,0 +1,16 @@
+# Authorization policy for the external gateway. Lives on the host, outside
+# agent control; its digest is recorded on the ledger at startup.
+# Deny by default: an action not listed for any of an agent's roles is refused.
+# The agent must ALSO hold a valid capability for the action's scope.
+version = 1
+
+[roles.worker]
+"inference"    = { max_per_minute = 30,  max_arg_bytes = 65536 }
+"memory.read"  = { max_per_minute = 120, max_arg_bytes = 1024 }
+"memory.write" = { max_per_minute = 60,  max_arg_bytes = 20000 }
+
+[roles.calculator]
+"tool:calculator" = { max_per_minute = 60, max_arg_bytes = 512 }
+
+[roles.validator]
+"inference" = { max_per_minute = 30, max_arg_bytes = 65536 }

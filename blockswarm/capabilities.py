@@ -16,11 +16,11 @@ from .signing import SigningService
 DOMAIN = "capability"
 
 # Scopes every agent may receive; others must be granted through roles.
-BASE_SCOPES = frozenset({"inference"})
+BASE_SCOPES = frozenset({"inference", "memory"})
 ROLE_SCOPES: dict[str, frozenset[str]] = {
-    "worker": frozenset({"inference"}),
-    "calculator": frozenset({"inference", "tool:calculator"}),
-    "validator": frozenset({"inference", "validate"}),
+    "worker": frozenset({"inference", "memory"}),
+    "calculator": frozenset({"inference", "memory", "tool:calculator"}),
+    "validator": frozenset({"inference", "memory", "validate"}),
 }
 
 

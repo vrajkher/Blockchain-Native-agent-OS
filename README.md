@@ -11,10 +11,12 @@ private scoped memory, short-lived scoped capabilities, signed task
 envelopes and signed result commitments, and its results are batched into
 Merkle-rooted ledger blocks.
 
-> **Status: Phase 1 of 5. This is a development prototype, not production
-> software.** Agents currently run in-process, which is **not a security
-> boundary**. The ledger is a **local simulation with no consensus**. See
-> [what is real and what is not](#what-is-real-and-what-is-not).
+> **Status: Phase 2 of 5. This is a development prototype, not production
+> software.** Secure mode runs each agent in its own Firecracker microVM, but
+> that path has **not booted a VM yet**: the build host has no KVM (see
+> [Phase 2 report](docs/PHASE2_REPORT.md)). The dev sandboxes are **not
+> security boundaries**. The ledger is a **local simulation with no
+> consensus**. See [what is real and what is not](#what-is-real-and-what-is-not).
 
 ## What is real and what is not
 
@@ -23,7 +25,9 @@ Merkle-rooted ledger blocks.
 | Ed25519 identities, host-managed signing service (keys never reach agents) | **Implemented** |
 | Signed task envelopes, replay protection (durable nonces), expiry | **Implemented** |
 | Short-lived, scoped, host-signed capabilities; policy outside agent control | **Implemented** |
-| Tool authorization gateway (fail-closed, rate-limited, audited) | **Implemented** (one tool: calculator) |
+| External authorization gateway: policy file, deny by default, rate/size limits, audit; in-process or separate process | **Implemented** |
+| Guest agent ↔ host broker RPC; capability never leaves the host; host-recorded evidence | **Implemented** |
+| Tools executed host-side behind the gateway | **Implemented** (one tool: calculator) |
 | One shared model via the Anthropic API (official SDK), structured outputs, refusal fallbacks | **Implemented**; tested against a local fake API, **not yet against the live API** |
 | Per-agent context/token limits, request concurrency 1, startup credential preflight | **Implemented** |
 | Asyncio scheduler, SQLite WAL durable queue, dependency graphs, leases, retries | **Implemented** |
@@ -33,8 +37,9 @@ Merkle-rooted ledger blocks.
 | Deterministic verification (signatures, commitments, schema, permissions, checkers) | **Implemented** |
 | `register_agent` … `revoke_agent` runtime functions, Merkle receipts | **Implemented** over a **simulated local ledger** |
 | Mock inference backend | **MOCK** (deterministic, labelled `mock: true` everywhere) |
-| Sandbox isolation | **NOT YET**: in-process only (dev mode). Secure mode refuses to start. |
-| Firecracker microVMs + jailer, vsock RPC | Phase 2 |
+| Dev sandboxes: in-process; separate process (unprivileged uid, empty env, rlimits, no network) | **Implemented**; **not** security boundaries |
+| Firecracker microVM per run via jailer (read-only rootfs, no NIC, vsock only, cgroup limits) | **Implemented, not booted**: jailer + Firecracker validated up to KVM creation; no KVM on the build host |
+| Guest image build (kernel + Ubuntu 24.04 rootfs + guest agent) | **Implemented**; guest userland tested via chroot |
 | EVM chain (Anvil / remote RPC), Solidity registries | Phase 3 |
 | Independent validators, quorum policies | Phase 4 |
 | Benchmarks on a real 8 GB CPU-only host | Phase 5 |
@@ -92,10 +97,53 @@ Admin endpoints need `Authorization: Bearer $(cat .blockswarm/api_token)`.
 | POST | `/v1/agents/{id}/revoke` | admin token |
 | POST | `/v1/inference` `{"agent_id", "capability", "messages"}` | agent capability (scope `inference`) |
 
+## Sandboxes
+
+All three backends run the same guest agent (`blockswarm/guest/agent.py`)
+over the same broker protocol. Only the isolation differs:
+
+| `security.sandbox_backend` | Isolation | Allowed in |
+|---|---|---|
+| `inprocess` | none: asyncio task in the host process | dev |
+| `process` | separate process: uid 65534, empty environment (no API keys), rlimits, own network namespace (no network) when started as root | dev |
+| `firecracker` | one microVM per run via jailer: own kernel, read-only rootfs, no network device, vsock only to its own broker, cgroup CPU/memory/pids limits | dev and **secure** |
+
+`security.mode = "secure"` refuses every backend except `firecracker`, and
+refuses to dispatch anything if KVM, the binaries or the guest image are
+missing.
+
+### Secure mode setup (Linux host with KVM, as root)
+
+```bash
+# 1. Firecracker + jailer (pinned release; check SHA256SUMS in the tarball)
+curl -fsSL https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.1/firecracker-v1.12.1-x86_64.tgz | tar xz
+install release-v1.12.1-x86_64/firecracker-v1.12.1-x86_64 /usr/local/bin/firecracker
+install release-v1.12.1-x86_64/jailer-v1.12.1-x86_64 /usr/local/bin/jailer
+# 2. Guest kernel + read-only rootfs with the guest agent
+scripts/build_guest_image.sh /var/lib/blockswarm
+# 3. Run
+python -m blockswarm --config config/blockswarm.example.toml demo --fresh --sandbox firecracker
+```
+
+### External authorization gateway
+
+```bash
+python -m blockswarm gateway --socket /run/blockswarm/gateway.sock \
+    --policy config/policy.example.toml --audit /var/log/blockswarm-gateway.jsonl
+# then set security.gateway = "unix:/run/blockswarm/gateway.sock"
+```
+
+The gateway process only needs the host's public key and read-only access to
+the agent registry. It cannot issue capabilities or sign anything. If it is
+unreachable, every request is denied.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -t .     # or: pytest
+# optional integration tests (root):
+BLOCKSWARM_FC_DIR=<dir with firecracker, jailer, vmlinux, rootfs.ext4> \
+BLOCKSWARM_GUEST_ROOT=<mounted guest-rootfs.ext4> python -m unittest discover -s tests -t .
 ```
 
 ## Benchmarks
@@ -119,9 +167,14 @@ blockswarm/
   nonces.py        durable replay protection
   inference.py     one shared model: Anthropic API (Claude) / MOCK; limits; concurrency
   harness.py       per-agent lightweight AI harness (runs inside the sandbox)
+  guest/agent.py   guest entry point: runs the harness, talks only to the broker
+  broker.py        host side of one sandbox run: serves RPC through the gateway
+  rpc.py           length-prefixed JSON framing (socketpair / vsock / Unix)
+  gateway.py       external authorization gateway: policy, limits, audit, remote mode
+  firecracker.py   microVM sandbox: preflight, VM config, jailer, vsock listener
   memory.py        private agent-scoped memory (zlib for large values)
   tools.py         external tool authorization gateway
-  sandbox.py       sandbox interface; in-process (dev); Firecracker placeholder
+  sandbox.py       sandbox backends: in-process, process (dev); factory + secure-mode policy
   queue.py         durable dependency-aware queue, leases, idempotency log
   governor.py      memory measurement and active-agent concurrency
   verifier.py      deterministic verification and verdicts
@@ -130,19 +183,21 @@ blockswarm/
   api.py           minimal authenticated HTTP API
   cli.py           command line
 docs/              architecture and phase reports
-scripts/           benchmark tool
+scripts/           benchmark, guest image build
 tests/             unit, integration and security tests
 ```
 
 ## Security notes
 
-* `security.mode = "dev"` runs agents **in-process**. This gives API-level
-  separation (bound memory views, capability checks), **not isolation**. A
-  malicious harness in the same Python process could bypass it. Do not run
-  untrusted tasks or models in dev mode.
-* `security.mode = "secure"` fails closed: the runtime refuses to start
-  unless a microVM sandbox backend is configured, and the Firecracker backend
-  refuses to run until Phase 2 implements it.
+* Dev sandboxes are **not isolation**. `inprocess` shares the host process.
+  `process` is a hardened separate process: it can still read world-readable
+  host files and shares the host kernel. Do not run untrusted tasks in dev
+  mode.
+* `security.mode = "secure"` fails closed: it requires the Firecracker
+  backend and refuses to dispatch when KVM, the binaries or the guest image
+  are missing.
+* Sandboxes never receive capabilities, keys or API credentials. The broker
+  holds the capability and asks the gateway before every action.
 * Task inputs (and dependency outputs fed into later tasks) are sent to the
   Anthropic API. Each request carries only the calling agent's own prompt;
   there is no shared conversation state between agents.

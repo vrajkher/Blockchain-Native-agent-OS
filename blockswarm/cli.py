@@ -22,6 +22,8 @@ def _cfg(args):
         inf["model"] = args.model
     if getattr(args, "effort", None):
         inf["effort"] = args.effort
+    if getattr(args, "sandbox", None):
+        overrides["security"] = {"sandbox_backend": args.sandbox}
     if inf:
         overrides["inference"] = inf
     return load_config(args.config, **overrides)
@@ -30,8 +32,13 @@ def _cfg(args):
 def _swarm(cfg, preflight: bool = False):
     from .inference import InferenceError
     from .swarm import Swarm
+    from .sandbox import SandboxUnavailable
     swarm = Swarm(cfg)
     if preflight:
+        try:
+            swarm.sandboxes.check()
+        except SandboxUnavailable as exc:
+            raise SystemExit(str(exc))
         try:
             swarm.backend.preflight()
         except InferenceError as exc:
@@ -130,6 +137,18 @@ def cmd_revoke(args) -> int:
     return 0
 
 
+def cmd_gateway(args) -> int:
+    from .gateway import serve_forever
+    cfg = _cfg(args)
+    pub = (cfg.home_path / "host_pubkey").read_text().strip()
+    try:
+        asyncio.run(serve_forever(str(cfg.db_path), pub, args.socket,
+                                  args.policy or cfg.security.policy_file or None, args.audit))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .api import ApiServer, load_or_create_token
     cfg = _cfg(args)
@@ -161,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--backend", choices=["anthropic", "mock"])
         sp.add_argument("--model", help="Claude model ID (default claude-opus-5-5)")
         sp.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+        sp.add_argument("--sandbox", choices=["inprocess", "process", "firecracker"])
 
     sp = sub.add_parser("init")
     sp.add_argument("--agents", type=int, default=2)
@@ -177,6 +197,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("agent_id")
     sp.add_argument("--reason", default="operator")
     sp.set_defaults(fn=cmd_revoke)
+    sp = sub.add_parser("gateway", help="run the authorization gateway as a separate process")
+    sp.add_argument("--socket", required=True, help="Unix socket path to listen on")
+    sp.add_argument("--policy", help="policy TOML (default: built-in policy)")
+    sp.add_argument("--audit", help="append-only JSONL audit log path")
+    sp.set_defaults(fn=cmd_gateway)
     sp = sub.add_parser("serve")
     sp.add_argument("--agents", type=int, default=2)
     backend_args(sp)

@@ -212,6 +212,10 @@ class BlockchainRuntime:
     def verify_receipt(self, receipt: dict) -> bool:
         return self.ledger.verify_receipt(receipt)
 
+    def record_policy(self, digest: str, version: int) -> str:
+        """Anchor the authorization policy in force, so audits can prove which rules applied."""
+        return self.ledger.append(self._entry("policy", policy_digest=digest, version=version))
+
     def revoke_agent(self, agent_id: str, reason: str) -> dict:
         h = self.ledger.append(self._entry("revoke_agent", agent_id=agent_id, reason=reason))
         return self._sealed(h)
